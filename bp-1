@@ -1,0 +1,365 @@
+import numpy as np
+import struct
+import random
+import matplotlib.pyplot as plt
+import pandas as pd
+import math
+
+def load_labels(file):
+    with open(file, "rb") as f:
+        data = f.read()
+    
+    magic_number, num_samples = struct.unpack(">ii", data[:8])
+    if magic_number != 2049:   # 0x00000801
+        print(f"magic number mismatch {magic_number} != 2049")
+        return None
+    
+    labels = np.array(list(data[8:]))
+    return labels
+
+def load_images(file):
+    with open(file, "rb") as f:
+        data = f.read()
+
+    magic_number, num_samples, image_width, image_height = struct.unpack(">iiii", data[:16])
+    if magic_number != 2051:   # 0x00000803
+        print(f"magic number mismatch {magic_number} != 2051")
+        return None
+    
+    image_data = np.asarray(list(data[16:]), dtype=np.uint8).reshape(num_samples, -1)
+    return image_data
+
+def one_hot(labels, classes, label_smoothing=0):
+    n = len(labels)
+    eoff = label_smoothing / classes
+    output = np.ones((n, classes), dtype=np.float32) * eoff
+    for row, label in enumerate(labels):
+        output[row, label] = 1 - label_smoothing + eoff
+    return output
+ class Dataset:
+    def __init__(self, images, labels):
+        self.images = images
+        self.labels = labels
+        
+    # 获取他的一个item，  dataset = Dataset(),   dataset[index]
+    def __getitem__(self, index):
+        return self.images[index], self.labels[index]
+    
+    # 获取数据集的长度，个数
+    def __len__(self):
+        return len(self.images)
+    
+class DataLoaderIterator:
+    def __init__(self, dataloader):
+        self.dataloader = dataloader
+        self.cursor = 0
+        self.indexs = list(range(self.dataloader.count_data))  # 0, ... 60000
+        if self.dataloader.shuffle:
+            # 打乱一下
+            random.shuffle(self.indexs)
+            
+    def __next__(self):
+        if self.cursor >= self.dataloader.count_data:
+            raise StopIteration()
+            
+        batch_data = []
+        remain = min(self.dataloader.batch_size, self.dataloader.count_data - self.cursor)  #  256, 128
+        for n in range(remain):
+            index = self.indexs[self.cursor]
+            data = self.dataloader.dataset[index]
+            
+            # 如果batch没有初始化，则初始化n个list成员
+            if len(batch_data) == 0:
+                batch_data = [[] for i in range(len(data))]
+                
+            #直接append进去
+            for index, item in enumerate(data):
+                batch_data[index].append(item)
+            self.cursor += 1
+            
+        # 通过np.vstack一次性实现合并，而非每次一直在合并
+        for index in range(len(batch_data)):
+            batch_data[index] = np.vstack(batch_data[index])
+        return batch_data
+
+class DataLoader:
+    
+    # shuffle 打乱
+    def __init__(self, dataset, batch_size, shuffle):
+        self.dataset = dataset
+        self.shuffle = shuffle
+        self.count_data = len(dataset)
+        self.batch_size = batch_size
+        
+    def __iter__(self):
+        return DataLoaderIterator(self)
+        
+        
+        
+ class Module:
+    def __init__(self, name):
+        self.name = name
+        
+    def __call__(self, *args):
+        return self.forward(*args)#函数转发了 
+        '''
+        model = Module('model')
+        model('abc')
+        model.__call__(abc)
+        model.forward(abc)
+        '''
+    
+class Initializer:
+    def __init__(self, name):
+        self.name = name
+        
+    def __call__(self, *args):
+        return self.apply(*args)
+        
+class GaussInitializer(Initializer):
+    # where :math:`\mu` is the mean and :math:`\sigma` the standard
+    # deviation. The square of the standard deviation, :math:`\sigma^2`,
+    # is called the variance.
+    def __init__(self, mu, sigma):
+        self.mu = mu
+        self.sigma = sigma
+        
+    def apply(self, value):
+        value[...] = np.random.normal(self.mu, self.sigma, value.shape)#随机初始化，大小是，和vaule一样
+            #【。。】是内部修改 ，inplace
+class Parameter:#负责对参数做更新
+    def __init__(self, value):
+        self.value = value
+        self.delta = np.zeros(value.shape)
+        
+    def zero_grad(self):
+        self.delta[...] = 0
+        
+class LinearLayer(Module):
+    def __init__(self, input_feature, output_feature):
+        super().__init__("Linear")
+        self.input_feature = input_feature
+        self.output_feature = output_feature
+        self.weights = Parameter(np.zeros((input_feature, output_feature)))
+        self.bias = Parameter(np.zeros((1, output_feature)))#偏置项
+        
+        # 权重初始化 
+        initer = GaussInitializer(0, 1.0)
+        initer.apply(self.weights.value)
+        
+    def forward(self, x):
+        self.x_save = x.copy()
+        return x @ self.weights.value + self.bias.value
+    
+    def backward(self, G):
+        self.weights.delta = self.x_save.T @ G
+        self.bias.delta[...] = np.sum(G, 0)  #值复制,不是mean，是sum:？？？？
+        return G @ self.weights.value.T
+    
+class ReLULayer(Module):
+    def __init__(self, inplace=True):
+        super().__init__("ReLU")
+        self.inplace = inplace
+        
+    def forward(self, x):
+        self.negative_position = x < 0
+        if not self.inplace:
+            x = x.copy()
+            
+        x[self.negative_position] = 0
+        return x
+    
+    def backward(self, G):#relu 的导数，x= 0 处，不可导，可以给1，也可以给0
+        if not self.inplace:
+            G = G.copy()
+            
+        G[self.negative_position] = 0
+        return G
+    
+class SigmoidCrossEntropyLayer(Module):
+    def __init__(self):
+        super().__init__("CrossEntropyLoss")
+        
+    def sigmoid(self, x):
+        return 1 / (1 + np.exp(-x))
+
+    def forward(self, x, label_onehot):
+        eps = 1e-4
+        self.label_onehot = label_onehot
+        self.predict = self.sigmoid(x)
+        self.predict = np.clip(self.predict, a_max=1-eps, a_min=eps)  # 裁切,防止下溢
+        self.batch_size = self.predict.shape[0]
+        return -np.sum(label_onehot * np.log(self.predict) + (1 - label_onehot) * 
+                        np.log(1 - self.predict)) / self.batch_size
+    
+    def backward(self):
+        return (self.predict - self.label_onehot) / self.batch_size
+    
+class SoftmaxCrossEntropyLayer(Module):
+    def __init__(self):
+        super().__init__("CrossEntropyLoss")
+        
+    def softmax(self, x):
+        return np.exp(x) / np.sum(np.exp(x), axis=1, keepdims=True)
+
+    def forward(self, x, label_onehot):
+        eps = 1e-4
+        self.label_onehot = label_onehot#为什么要onehot???
+        self.predict = self.softmax(x)
+        self.predict = np.clip(self.predict, a_max=1-eps, a_min=eps)  # 裁切，防止下溢
+        self.batch_size = self.predict.shape[0]
+        return -np.sum(label_onehot * np.log(self.predict) + (1 - label_onehot) * 
+                        np.log(1 - self.predict)) / self.batch_size
+    
+    def backward(self):
+        return (self.predict - self.label_onehot) / self.batch_size#求导：对x的导数，
+        
+        
+   class Optimizer:#参数更新，把参数提出出来
+    def __init__(self, name, model, lr):
+        self.name = name
+        self.model = model
+        self.lr = lr
+        
+        layers = []
+        self.params = []#把参数存起来，提取出来
+        for attr in model.__dict__:#取字典的值
+            layer = model.__dict__[attr]
+            if isinstance(layer, Module):
+                layers.append(layer)
+        #判断是否有参数        
+        for layer in layers:
+            for attr in layer.__dict__:
+                layer_param = layer.__dict__[attr]
+                if isinstance(layer_param, Parameter):
+                    self.params.append(layer_param)
+                
+    def zero_grad(self):#延申：如果不做zero_grad,则，计算得到的梯度进行累加，这种情况，适用于分批次训练后求梯度平均值
+        for param in self.params:
+            param.zero_grad()
+            
+    def set_lr(self, lr):
+        self.lr = lr
+        
+class SGD(Optimizer):#子类
+    def __init__(self, model, lr=1e-3):
+        super().__init__("SGD", model, lr)
+    
+    def step(self):
+        for param in self.params:
+            param.value -= self.lr * param.delta
+            
+class SGDMomentum(Optimizer):#动量SGD
+    def __init__(self, model, lr=1e-3, momentum=0.9):
+        super().__init__("SGDMomentum", model, lr)
+        self.momentum = momentum
+        
+        for param in self.params:
+            param.v = 0
+    
+    def step(self):
+        for param in self.params:
+            param.v = self.momentum * param.v - self.lr * param.delta
+            param.value += param.v
+            
+class Adam(Optimizer):
+    def __init__(self, model, lr=1e-3, beta1=0.9, beta2=0.999,momentum=0.01):
+        super().__init__("Adam", model, lr)
+        self.momentum = momentum
+        self.beta1 = beta1
+        self.beta2 = beta2
+        self.t = 0
+        
+        for param in self.params:
+            param.m = 0
+            param.v = 0
+            
+    def step(self):#参考论文公式
+        eps = 1e-8
+        self.t += 1
+        for param in self.params:
+            g = param.delta
+            param.m = self.beta1 * param.m + (1 - self.beta1) * g
+            param.v = self.beta2 * param.v + (1 - self.beta2) * g ** 2
+            mt_ = param.m / (1 - self.beta1 ** self.t)
+            vt_ = param.v / (1 - self.beta2 ** self.t)
+            param.value -= self.lr * mt_ / (np.sqrt(vt_) + eps)
+class Model(Module):
+    def __init__(self, num_feature, num_hidden, num_classes):#特征，隐层，类别
+        super().__init__("Model")
+        self.input_to_hidden = LinearLayer(num_feature, num_hidden)
+        self.relu = ReLULayer()
+        self.hidden_to_output = LinearLayer(num_hidden, num_classes)
+    
+    def forward(self, x):
+        x = self.input_to_hidden(x) # x = self.input_to_hidden.__call(x),也就是forward(x),相当于调用了linerlayer的forward 函数
+        x = self.relu(x)
+        x = self.hidden_to_output(x)
+        return x
+    
+    def backward(self, G):
+        G = self.hidden_to_output.backward(G)
+        G = self.relu.backward(G)
+        G = self.input_to_hidden.backward(G)
+        return G
+ def sigmoid(x):
+    return 1 / (1 + np.exp(-x))
+    
+def estimate_val(predict, gt_labels, classes, loss_func):
+    plabel = predict.argmax(1)
+    positive = plabel == val_labels
+    total_images = predict.shape[0]
+    accuracy = sum(positive) / total_images
+    return accuracy, loss_func(predict, one_hot(gt_labels, classes))
+    
+    
+classes = 10                  # 定义10个类别
+batch_size = 32              # 定义每个批次的大小
+epochs = 20                   # 退出策略，也就是最大把所有数据看10次
+lr = 1e-3
+numdata, data_dims = train_images.shape  # 60000, 784
+
+# 定义dataloader和dataset，用于数据抓取
+train_data = DataLoader(Dataset(train_images, one_hot(train_labels, classes)), batch_size, shuffle=True)
+model = Model(data_dims, 256, classes)
+#loss_func = SoftmaxCrossEntropyLayer()
+loss_func = SigmoidCrossEntropyLayer()
+optim = Adam(model, lr)
+iters = 0   # 定义迭代次数，因为我们需要展示loss曲线，那么x将会是iters
+
+lr_schedule = {
+#     3000: 1e-1,
+#     6000: 1e-2,
+#     10000: 1e-3,
+#     15000: 1e-4
+}
+
+# 开始进行epoch循环，总数是epochs次
+for epoch in range(epochs):
+    
+    # 对一个批次内的数据进行迭代，每一次迭代都是一个batch（即256）
+    for index, (images, labels) in enumerate(train_data):
+        
+        # 如果当前的迭代次数在warm up计划改变的节点时。就修改warm up的alpha值为当前需要修改的值
+        if iters in lr_schedule:
+            lr = lr_schedule[iters]
+            optim.set_lr(lr)
+        
+        x = model(images) #forward#x是隐层的输出
+        # x = model.__call__(images) #a^b = a.__xor__(b); a@b = a.__matmul__(b);a == b  = a.__eq__(b)
+        #iter() = __iter__
+        # 计算loss值
+        loss = loss_func(x, labels)
+        
+        optim.zero_grad()
+        G = loss_func.backward()
+        model.backward(G)
+        optim.step()#应用梯度，更新参数
+        
+        iters += 1
+        
+        if iters % 1000 == 0:
+            print(f"Iter {iters}, {epoch} / {epochs}, Loss {loss:.3f}, LR {lr:g}")
+            
+    val_accuracy, val_loss = estimate_val(model(val_images), val_labels, classes, loss_func)
+    print(f"Val set, Accuracy: {val_accuracy:.3f}, Loss: {val_loss:.3f}")
